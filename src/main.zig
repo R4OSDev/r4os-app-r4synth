@@ -2,6 +2,8 @@ const r4os = @import("r4os");
 
 const max_file = 262_144;
 const wav_chunk_bytes = 8192;
+const synth_sample_rate: u32 = 48_000;
+const synth_render_max_frames: u16 = 1024;
 const selftest_arg = "/SELFTEST";
 
 const WavInfo = struct {
@@ -13,10 +15,18 @@ const WavInfo = struct {
 };
 
 const Midi = struct {
-    tempo_ticks: u32 = 50,
+    tempo_micros_per_quarter: u32 = 500_000,
     division: u32 = 480,
+    frame_remainder: u64 = 0,
+    pacing_remainder: u64 = 0,
     running_status: u8 = 0,
     paused: bool = false,
+};
+
+const MidiTrackResult = enum {
+    complete,
+    quit,
+    failed,
 };
 
 const App = struct {
@@ -56,6 +66,11 @@ const App = struct {
 
     fn sleepTicks(self: *const App, duration: u64) void {
         self.sys.sleepTicks(duration);
+    }
+
+    fn timerHz(self: *const App) u64 {
+        const hz = self.sys.monotonicHz();
+        return if (hz == 0) 100 else hz;
     }
 
     fn readKey(self: *const App) u8 {
@@ -117,6 +132,10 @@ const App = struct {
 
     fn midiSend(self: *const App, handle: u32, channel: u8, status: u8, data1: u8, data2: u8) i32 {
         return self.advanced.midiSend(handle, channel, status, data1, data2);
+    }
+
+    fn midiRender(self: *const App, handle: u32, frames: u16) i32 {
+        return self.advanced.midiRender(handle, frames);
     }
 
     fn midiClose(self: *const App, handle: u32) i32 {
@@ -191,6 +210,8 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
     var offset = info.data_offset;
     const end = minUsize(data.len, info.data_offset + info.data_len);
     var prefill: u32 = 2;
+    var pacing_remainder: u64 = 0;
+    const timer_hz = ctx.timerHz();
 
     while (offset < end) {
         const key = ctx.readKey();
@@ -212,7 +233,8 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         if (prefill > 0) {
             prefill -= 1;
         } else {
-            ctx.sleepTicks(ticksForFrames(frames.frame_count, info.sample_rate));
+            const wait_ticks = ticksForFrames(frames.frame_count, info.sample_rate, timer_hz, &pacing_remainder);
+            if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
         }
     }
 
@@ -361,6 +383,8 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
     if (play_addr != 0) {
         ctx.println("Playing SID. P=Pause Q=Quit");
         var paused = false;
+        var pacing_remainder: u64 = 0;
+        const timer_hz = ctx.timerHz();
         while (true) {
             const key = ctx.readKey();
             if (key == 'q' or key == 'Q') break;
@@ -368,20 +392,36 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
                 paused = !paused;
                 ctx.println(if (paused) "Paused" else "Playing");
             }
-            if (!paused and ctx.sidPlayFrame(sid_handle, play_addr, 50) < 0) {
-                return sidFailRelease(ctx, sid_handle);
+            if (!paused) {
+                while (true) {
+                    const result = ctx.sidPlayFrame(sid_handle, play_addr, 50);
+                    if (result == r4os.abi.service_api_result_busy) {
+                        ctx.sleepTicks(1);
+                        continue;
+                    }
+                    if (result < 0) return sidFailRelease(ctx, sid_handle);
+                    break;
+                }
+                const wait_ticks = ticksForFrames(1, 50, timer_hz, &pacing_remainder);
+                if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
+            } else {
+                ctx.sleepTicks(1);
             }
-            ctx.sleepTicks(2);
         }
     }
 
-    _ = ctx.sidStop(sid_handle);
-    _ = ctx.sidRelease(sid_handle);
+    const stopped = ctx.sidStop(sid_handle);
+    const released = ctx.sidRelease(sid_handle);
+    if (stopped < 0 or released < 0) {
+        ctx.println("SID runtime failed. Run AUDIO.");
+        return 7;
+    }
     ctx.println("SID playback stopped. Run AUDIO.");
     return 0;
 }
 
 fn sidFailRelease(ctx: *const App, handle: u32) i32 {
+    _ = ctx.sidStop(handle);
     _ = ctx.sidRelease(handle);
     ctx.println("SID runtime failed. Run AUDIO.");
     return 7;
@@ -408,31 +448,37 @@ fn playMidi(ctx: *const App, data: []const u8) i32 {
     ctx.println("Playing MIDI. P=Pause Q=Quit");
     var pos: usize = 14;
     var track_index: u16 = 0;
+    var outcome: MidiTrackResult = .complete;
     while (track_index < tracks and pos + 8 <= data.len) : (track_index += 1) {
         if (!eql(data[pos .. pos + 4], "MTrk")) break;
         const track_len = readBe32(data, pos + 4);
         const track_start = pos + 8;
         const track_end = minUsize(data.len, track_start + @as(usize, @intCast(track_len)));
-        if (playMidiTrack(ctx, data[track_start..track_end], synth, &midi)) break;
+        outcome = playMidiTrack(ctx, data[track_start..track_end], synth, &midi);
+        if (outcome != .complete) break;
         pos = track_end;
         if ((track_len & 1) != 0 and pos < data.len) pos += 1;
         if (format == 0) break;
     }
 
-    _ = ctx.midiClose(synth);
+    const close_result = ctx.midiClose(synth);
+    if (outcome == .failed or close_result < 0) {
+        ctx.println("MIDI playback failed.");
+        return 6;
+    }
     ctx.println("Done.");
     return 0;
 }
 
-fn playMidiTrack(ctx: *const App, track: []const u8, synth: u32, midi: *Midi) bool {
+fn playMidiTrack(ctx: *const App, track: []const u8, synth: u32, midi: *Midi) MidiTrackResult {
     var pos: usize = 0;
     var sent: u32 = 0;
     while (pos < track.len and sent < 16_384) {
         const delta = readVlq(track, &pos) orelse break;
-        waitMidi(ctx, midi, delta);
-        if (checkPlaybackKey(ctx, &midi.paused)) return true;
+        if (waitMidi(ctx, midi, synth, delta) < 0) return .failed;
+        if (checkPlaybackKey(ctx, &midi.paused)) return .quit;
         while (midi.paused) {
-            if (checkPlaybackKey(ctx, &midi.paused)) return true;
+            if (checkPlaybackKey(ctx, &midi.paused)) return .quit;
             ctx.sleepTicks(1);
         }
         if (pos >= track.len) break;
@@ -452,10 +498,10 @@ fn playMidiTrack(ctx: *const App, track: []const u8, synth: u32, midi: *Midi) bo
             pos += 1;
             const len = readVlq(track, &pos) orelse break;
             if (pos + len > track.len) break;
-            if (meta == 0x2F) return false;
+            if (meta == 0x2F) return .complete;
             if (meta == 0x51 and len == 3) {
                 const micros = (@as(u32, track[pos]) << 16) | (@as(u32, track[pos + 1]) << 8) | track[pos + 2];
-                midi.tempo_ticks = maxU32(1, micros / 10_000);
+                midi.tempo_micros_per_quarter = maxU32(1, micros);
             }
             pos += len;
             continue;
@@ -479,11 +525,11 @@ fn playMidiTrack(ctx: *const App, track: []const u8, synth: u32, midi: *Midi) bo
         };
 
         if (shouldSendMidi(event_type, data1)) {
-            _ = ctx.midiSend(synth, channel, event_type, data1, data2);
+            if (ctx.midiSend(synth, channel, event_type, data1, data2) < 0) return .failed;
             sent += 1;
         }
     }
-    return false;
+    return .complete;
 }
 
 fn shouldSendMidi(event_type: u8, data1: u8) bool {
@@ -491,15 +537,34 @@ fn shouldSendMidi(event_type: u8, data1: u8) bool {
         (event_type == 0xB0 and (data1 == 7 or data1 == 10 or data1 == 11 or data1 == 120 or data1 == 121 or data1 == 123));
 }
 
-fn waitMidi(ctx: *const App, midi: *const Midi, delta: u32) void {
-    if (delta == 0) return;
-    const ticks = maxU32(1, (delta * midi.tempo_ticks) / midi.division);
-    var remaining = ticks;
-    while (remaining > 0) {
-        const step = if (remaining > 2) 2 else remaining;
-        ctx.sleepTicks(step);
-        remaining -= step;
+fn waitMidi(ctx: *const App, midi: *Midi, synth: u32, delta: u32) i32 {
+    var remaining_frames = midiFramesForDelta(midi, delta);
+    const timer_hz = ctx.timerHz();
+    while (remaining_frames > 0) {
+        const frames: u16 = @intCast(@min(remaining_frames, @as(u64, synth_render_max_frames)));
+        while (true) {
+            const result = ctx.midiRender(synth, frames);
+            if (result == r4os.abi.service_api_result_busy) {
+                ctx.sleepTicks(1);
+                continue;
+            }
+            if (result < 0) return result;
+            break;
+        }
+        const wait_ticks = ticksForFrames(frames, synth_sample_rate, timer_hz, &midi.pacing_remainder);
+        if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
+        remaining_frames -= @as(u64, frames);
     }
+    return 0;
+}
+
+fn midiFramesForDelta(midi: *Midi, delta: u32) u64 {
+    if (delta == 0 or midi.division == 0) return 0;
+    const denominator = @as(u128, midi.division) * 1_000_000;
+    const numerator = @as(u128, delta) * midi.tempo_micros_per_quarter * synth_sample_rate + midi.frame_remainder;
+    const frames = numerator / denominator;
+    midi.frame_remainder = @intCast(numerator % denominator);
+    return @intCast(frames);
 }
 
 fn checkPlaybackKey(ctx: *const App, paused: *bool) bool {
@@ -525,10 +590,12 @@ fn readVlq(data: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
-fn ticksForFrames(frames: u32, sample_rate: u32) u64 {
+fn ticksForFrames(frames: u64, sample_rate: u64, timer_hz: u64, remainder: *u64) u64 {
     if (sample_rate == 0) return 1;
-    const ticks = (frames * 100 + sample_rate / 2) / sample_rate;
-    return maxU64(1, ticks);
+    const numerator = frames * timer_hz + remainder.*;
+    const ticks = numerator / sample_rate;
+    remainder.* = numerator % sample_rate;
+    return ticks;
 }
 
 fn printTextField(ctx: *const App, label: []const u8, data: []const u8, offset: usize) void {
@@ -637,9 +704,5 @@ fn minUsize(a: usize, b: usize) usize {
 }
 
 fn maxU32(a: u32, b: u32) u32 {
-    return if (a > b) a else b;
-}
-
-fn maxU64(a: u64, b: u64) u64 {
     return if (a > b) a else b;
 }

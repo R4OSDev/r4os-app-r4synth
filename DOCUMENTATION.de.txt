@@ -3,24 +3,23 @@
 
 R4Synth ist der Shell-Mediaplayer fuer WAV, SID und MIDI.
 
-Build:
+Build unter Linux beziehungsweise Windows:
 
-    cd Code\System\Software\R4Synth
-    ..\..\..\DevTools\Zig\zig.exe build
+    ./Build.sh
+    Build.bat
 
 Ergebnis:
 
-    Code\System\Software\R4Synth\zig-out\SYNTH.R4X
+    Artifacts/Modules/SYNTH/SYNTH.R4X
 
 Projektstruktur seit 0.51.20:
 - `build.zig` baut die App als eigenes SDK-Projekt.
 - `build.zig.zon` bindet `r4os_sdk` als Paket.
 - `module.R4MF` beschreibt Artefakt, Zielpfad, R4DESK-/R4AUDIO-Imports und Contract.
-- Der zentrale `cd Code`-Build baut weiterhin das Image-Artefakt
-  `Code\zig-out\SYNTH.R4X`.
+- Der Workspace-Build uebernimmt das Modul in den ausgewaehlten Imageplan.
 
 Contract:
-- R4XStart-Entry: `synth_main`
+- fachlicher Einstieg: `r4_app_main`; das SDK exportiert `R4XStart`
 - App-Klasse: `console`
 - R4L-Imports: `R4SYS`, `R4DESK`, `R4AUDIO`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\SYNTH.R4X`
@@ -34,4 +33,13 @@ Aktueller Stand:
 - WAV-Wiedergabe normalisiert intern auf stereo/s16le.
 - PSID/RSID-Erkennung mit Header-Ausgabe und SID-Runtime ueber SID.R4D.
 - MIDI-Wiedergabe ueber das MIDI-Backend mit Note/Program/Controller-Events.
+- WAV-, SID- und MIDI-Zeit werden aus der wirksamen R4SYS-Ereignisrate
+  abgeleitet. MIDI-Tempo bleibt in Mikrosekunden pro Viertelnote erhalten und
+  wird mit Restakkumulator in 48-kHz-Frames umgerechnet; eine Viertelnote bei
+  120 BPM umfasst dadurch 24.000 Frames beziehungsweise 500 ms.
+- MIDI rendert produktiv in Bloecken von 1 bis 1024 Frames. `Busy` wiederholt
+  denselben gepufferten Block; andere Synth- und AudioBackend-Fehler werden
+  sichtbar abgebrochen.
+- SID wiederholt bei `Busy` denselben Kernelblock und fuehrt den Gastframe
+  nicht doppelt aus. Stop, Release und Fehler verwenden denselben Abbaupfad.
 - P pausiert, Q beendet die Wiedergabe.
