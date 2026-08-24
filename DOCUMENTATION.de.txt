@@ -30,7 +30,14 @@ unter C:\Temp\, z.B. C:\Temp\tada.wav.
 
 Aktueller Stand:
 - PCM-WAV mono/stereo mit 8-bit unsigned oder 16-bit signed little endian.
-- WAV-Wiedergabe normalisiert intern auf stereo/s16le.
+- WAV-Wiedergabe gibt bereits passendes Stereo-S16LE direkt aus dem
+  Dateipuffer aus. Nur Mono- oder 8-Bit-PCM wird nach Stereo-S16LE gewandelt.
+- WAV-Bloecke passen in genau ein AudioService-Payload. Teilfortschritt wird
+  framegenau beibehalten; Busy wiederholt nur den Rest, Timeout oder Fehler
+  brechen sichtbar ab und ein fehlgeschlagener Lauf meldet nicht `Done`.
+- Die Vorfuellung richtet sich nach 160 ms tatsaechlich angenommenem PCM.
+  Danach und beim abschliessenden Leeren wird ausschliesslich die akzeptierte
+  Framezahl mit der wirksamen R4SYS-Ereignisrate getaktet.
 - PSID/RSID-Erkennung mit Header-Ausgabe und SID-Runtime ueber SID.R4D.
 - MIDI-Wiedergabe ueber das MIDI-Backend mit Note/Program/Controller-Events.
 - WAV-, SID- und MIDI-Zeit werden aus der wirksamen R4SYS-Ereignisrate

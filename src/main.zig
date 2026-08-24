@@ -1,7 +1,9 @@
 const r4os = @import("r4os");
 
 const max_file = 262_144;
-const wav_chunk_bytes = 8192;
+const audio_frame_bytes: usize = 2 * @sizeOf(i16);
+const audio_prefill_milliseconds: u64 = 160;
+const wav_chunk_bytes = r4os.app_audio.max_write_payload - r4os.app_audio.max_write_payload % audio_frame_bytes;
 const synth_sample_rate: u32 = 48_000;
 const synth_render_max_frames: u16 = 1024;
 const selftest_arg = "/SELFTEST";
@@ -27,6 +29,43 @@ const MidiTrackResult = enum {
     complete,
     quit,
     failed,
+};
+
+const PlaybackPacer = struct {
+    sample_rate: u64,
+    timer_hz: u64,
+    target_frames: u64,
+    buffered_frames: u64 = 0,
+    remainder: u64 = 0,
+
+    fn init(sample_rate: u32, timer_hz: u64) PlaybackPacer {
+        const rate: u64 = sample_rate;
+        return .{
+            .sample_rate = rate,
+            .timer_hz = timer_hz,
+            .target_frames = (rate * audio_prefill_milliseconds + 999) / 1000,
+        };
+    }
+
+    fn accepted(self: *PlaybackPacer, ctx: *const App, bytes: usize) void {
+        self.buffered_frames += @as(u64, @intCast(bytes / audio_frame_bytes));
+        if (self.buffered_frames <= self.target_frames) return;
+        const paced_frames = self.buffered_frames - self.target_frames;
+        self.buffered_frames = self.target_frames;
+        self.sleepFrames(ctx, paced_frames);
+    }
+
+    fn drain(self: *PlaybackPacer, ctx: *const App) void {
+        const frames = self.buffered_frames;
+        self.buffered_frames = 0;
+        self.sleepFrames(ctx, frames);
+    }
+
+    fn sleepFrames(self: *PlaybackPacer, ctx: *const App, frames: u64) void {
+        if (frames == 0) return;
+        const wait_ticks = ticksForFrames(frames, self.sample_rate, self.timer_hz, &self.remainder);
+        if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
+    }
 };
 
 const App = struct {
@@ -84,11 +123,8 @@ const App = struct {
         };
     }
 
-    fn audioWrite(_: *const App, stream: *r4os.AudioStream, data: []const u8) usize {
-        return switch (stream.write(data, r4os.time_contract.timeoutForever())) {
-            .written => |bytes| bytes,
-            else => 0,
-        };
+    fn audioWrite(_: *const App, stream: *r4os.AudioStream, data: []const u8) r4os.app_audio.WriteResult {
+        return stream.write(data, r4os.time_contract.timeoutForever());
     }
 
     fn audioClose(_: *const App, stream: *r4os.AudioStream) bool {
@@ -186,9 +222,11 @@ fn runSelfTest(ctx: *const App) i32 {
     var pcm: [512]u8 = undefined;
     fillSelfTestPcm(pcm[0..]);
     var stream = ctx.audioOpenStream(48_000, 2, .s16le) orelse return synthFail(ctx, "stream-open");
-    const written = ctx.audioWrite(&stream, pcm[0..]);
+    var pacer = PlaybackPacer.init(48_000, ctx.timerHz());
+    const written = writeAudioBlock(ctx, &stream, pcm[0..], &pacer);
+    if (written) pacer.drain(ctx);
     const closed = ctx.audioClose(&stream);
-    if (written != pcm.len or !closed) return synthFail(ctx, "stream-cycle");
+    if (!written or !closed) return synthFail(ctx, "stream-cycle");
 
     ctx.println("SYNTH selftest: OK");
     return 0;
@@ -207,15 +245,17 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
 
     ctx.println("Playing WAV. P=Pause Q=Quit");
     var paused = false;
+    var quit = false;
     var offset = info.data_offset;
     const end = minUsize(data.len, info.data_offset + info.data_len);
-    var prefill: u32 = 2;
-    var pacing_remainder: u64 = 0;
-    const timer_hz = ctx.timerHz();
+    var pacer = PlaybackPacer.init(info.sample_rate, ctx.timerHz());
 
     while (offset < end) {
         const key = ctx.readKey();
-        if (key == 'q' or key == 'Q') break;
+        if (key == 'q' or key == 'Q') {
+            quit = true;
+            break;
+        }
         if (key == 'p' or key == 'P') {
             paused = !paused;
             ctx.println(if (paused) "Paused" else "Playing");
@@ -225,22 +265,55 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
             continue;
         }
 
-        const frames = convertWavChunk(info, data[offset..end], pcm_buffer[0..]);
-        if (frames.bytes_read == 0 or frames.bytes_written == 0) break;
-        _ = ctx.audioWrite(&stream, pcm_buffer[0..frames.bytes_written]);
-        offset += frames.bytes_read;
-
-        if (prefill > 0) {
-            prefill -= 1;
-        } else {
-            const wait_ticks = ticksForFrames(frames.frame_count, info.sample_rate, timer_hz, &pacing_remainder);
-            if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
+        const chunk = prepareWavChunk(info, data[offset..end], pcm_buffer[0..]);
+        if (chunk.bytes_read == 0 or chunk.pcm.len == 0) break;
+        if (!writeAudioBlock(ctx, &stream, chunk.pcm, &pacer)) {
+            _ = ctx.audioClose(&stream);
+            ctx.println("Audio write failed.");
+            return 5;
         }
+        offset += chunk.bytes_read;
     }
 
-    _ = ctx.audioClose(&stream);
+    if (!quit) pacer.drain(ctx);
+    if (!ctx.audioClose(&stream)) {
+        ctx.println("Audio close failed.");
+        return 5;
+    }
     ctx.println("Done.");
     return 0;
+}
+
+fn writeAudioBlock(ctx: *const App, stream: *r4os.AudioStream, data: []const u8, pacer: *PlaybackPacer) bool {
+    var cursor = r4os.app_audio.WriteCursor.init(data.len, audio_frame_bytes) orelse return false;
+    while (!cursor.done()) {
+        const advance = cursor.apply(ctx.audioWrite(stream, data[cursor.accepted..]));
+        switch (advance.outcome) {
+            .complete => {
+                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted);
+                return cursor.done();
+            },
+            .retry => {
+                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted) else ctx.sleepTicks(1);
+            },
+            .timed_out, .failure, .invalid => return false,
+        }
+    }
+    return true;
+}
+
+const WavChunk = struct {
+    bytes_read: usize,
+    pcm: []const u8,
+};
+
+fn prepareWavChunk(info: WavInfo, src: []const u8, out: []u8) WavChunk {
+    if (info.channels == 2 and info.bits == 16) {
+        const bytes = minUsize(src.len - src.len % audio_frame_bytes, wav_chunk_bytes);
+        return .{ .bytes_read = bytes, .pcm = src[0..bytes] };
+    }
+    const converted = convertWavChunk(info, src, out);
+    return .{ .bytes_read = converted.bytes_read, .pcm = out[0..converted.bytes_written] };
 }
 
 const Converted = struct {
