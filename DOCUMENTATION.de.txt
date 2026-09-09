@@ -50,3 +50,36 @@ Aktueller Stand:
 - SID wiederholt bei `Busy` denselben Kernelblock und fuehrt den Gastframe
   nicht doppelt aus. Stop, Release und Fehler verwenden denselben Abbaupfad.
 - P pausiert, Q beendet die Wiedergabe.
+
+
+Aufrufgrenzen und Zeitbasis ab 0.78.74
+-----------------------------------
+Der Hostaufruf legt eine aeussere Ruecksprungadresse auf den emulierten
+Stack. Innere JSR/RTS und ausgeglichene Stackdaten laufen weiter; erst die
+passende aeussere Stack-/Adressrueckkehr beendet den Aufruf erfolgreich.
+BRK, unbekannte Befehle und das Instruktionsbudget bleiben sichtbare Fehler.
+
+sid_load_data ersetzt den gesamten Titel-RAM samt Laufzeit, Registern und
+PCM-Rest. Auch eine ungueltige Neuladung verwirft den alten Titel. Init muss
+in den aktuellen Ladebereich zeigen. Play darf auch vom aktuellen Titel
+beschriebenes RAM verwenden, etwa nach Dekompression oder Codeverlagerung.
+Gemappte I/O-Adressen und nicht vorhandenes ROM sind keine Einsprungpunkte.
+Mehrere Segmente sind nur ueber den Diagnosehelfer loadProgram ausdruecklich
+moeglich; der oeffentliche Ein-Block-Ladeaufruf haengt niemals Segmente an.
+
+Die Audiomenge folgt 48000 Stereo-s16le-Frames pro Sekunde mit Restuebertrag:
+50 Hz liefern 960 Frames, 60 Hz liefern 800. Auch andere ganzzahlige Raten
+von 50 bis 48000 Hz sind innerhalb des bestehenden 3840-Byte-Puffers erlaubt;
+0 waehlt 50 Hz. Ein Frequenzwechsel startet eine neue Restfolge. Ein zu
+kleiner Ausgabepuffer verbraucht weder Frames noch Rest. Der Wrapper meldet
+die tatsaechliche Laenge, auch bei Stille.
+
+R4Synth verwendet Subsong-Speedbit und Clock-Flags fuer PAL-VBI mit 50 Hz
+beziehungsweise NTSC-VBI/Standard-CIA mit 60 Hz und taktet mit derselben Rate.
+Legacy-Header wiederholen Speedbits modulo 32, moderne C64-kompatible Header
+verwenden Bit 31 fuer hoehere Subsongs. Init-Adresse 0 meint die effektive
+Ladeadresse. IRQ-gesteuerte PSID-/RSID-Titel werden vor dem Start als nicht
+unterstuetzt gemeldet. Vollstaendige ROM-/IRQ-Ausfuehrung, dynamische
+CIA-Timer und echte NTSC-Oszillator-/VIC-Takte sind weiterhin nicht enthalten.
+
+Referenz: https://hvsc.c64.org/download/C64Music/DOCUMENTS/SID_file_format.txt

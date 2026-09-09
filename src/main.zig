@@ -399,19 +399,33 @@ fn parseWav(data: []const u8) ?WavInfo {
 }
 
 fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
-    if (data.len < 124) {
-        ctx.println("Unsupported format. Need PCM WAV mono/stereo 8/16-bit.");
+    if (data.len < 118) {
+        ctx.println("Invalid SID header.");
         return 3;
     }
 
     const version = readBe16(data, 4);
+    if (version < 1 or version > 4 or (version >= 2 and data.len < 124)) {
+        ctx.println("Invalid SID version or header.");
+        return 3;
+    }
+    const flags = if (version >= 2) readBe16(data, 118) else 0;
     const header_data_offset = readBe16(data, 6);
     var load_addr = readBe16(data, 8);
-    const init_addr = readBe16(data, 10);
+    var init_addr = readBe16(data, 10);
     const play_addr = readBe16(data, 12);
     const songs = readBe16(data, 14);
     const start_song = readBe16(data, 16);
     const speed = readBe32(data, 18);
+    if (songs == 0 or songs > 256 or start_song == 0 or start_song > songs) {
+        ctx.println("Invalid SID song selection.");
+        return 3;
+    }
+    const frame_hz = sidFrameHz(version, flags, speed, start_song);
+    if (!psid or play_addr == 0) {
+        ctx.println("SID interrupt-driven playback is not supported.");
+        return 3;
+    }
 
     ctx.println("SID detected.");
     ctx.println(if (psid) "Format: PSID" else "Format: RSID");
@@ -430,7 +444,7 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
     ctx.write("\r\n");
 
     var data_offset: usize = header_data_offset;
-    if (data_offset >= data.len) {
+    if (data_offset < @as(usize, if (version == 1) 118 else 124) or data_offset >= data.len) {
         ctx.println("SID runtime failed. Run AUDIO.");
         return 7;
     }
@@ -443,6 +457,8 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
         data_offset += 2;
     }
 
+    if (init_addr == 0) init_addr = load_addr;
+    ctx.println(if (frame_hz == 60) "Playback rate: 60 Hz" else "Playback rate: 50 Hz");
     ctx.println("Starting SID runtime...");
     const handle = ctx.sidAcquire();
     if (handle < 0) {
@@ -467,7 +483,7 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
             }
             if (!paused) {
                 while (true) {
-                    const result = ctx.sidPlayFrame(sid_handle, play_addr, 50);
+                    const result = ctx.sidPlayFrame(sid_handle, play_addr, frame_hz);
                     if (result == r4os.abi.service_api_result_busy) {
                         ctx.sleepTicks(1);
                         continue;
@@ -475,7 +491,7 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
                     if (result < 0) return sidFailRelease(ctx, sid_handle);
                     break;
                 }
-                const wait_ticks = ticksForFrames(1, 50, timer_hz, &pacing_remainder);
+                const wait_ticks = ticksForFrames(1, frame_hz, timer_hz, &pacing_remainder);
                 if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
             } else {
                 ctx.sleepTicks(1);
@@ -491,6 +507,16 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
     }
     ctx.println("SID playback stopped. Run AUDIO.");
     return 0;
+}
+
+// HVSC SID_file_format.txt: VBI uses the selected PAL/NTSC clock;
+// CIA speed bits request the default 60-Hz call cadence (not dynamic timers).
+fn sidFrameHz(version: u16, flags: u16, speed: u32, song: u16) u16 {
+    const index = song - 1;
+    const speed_bit: u5 = @intCast(if (version == 1 or flags & 2 != 0) index % 32 else @min(index, 31));
+    const cia = speed & (@as(u32, 1) << speed_bit) != 0;
+    const ntsc = version >= 2 and ((flags >> 2) & 3) == 2;
+    return if (cia or ntsc) 60 else 50;
 }
 
 fn sidFailRelease(ctx: *const App, handle: u32) i32 {
