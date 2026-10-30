@@ -10,4 +10,12 @@ pub fn build(b: *std.Build) void {
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
+
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/playback_test.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    tests.root_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    b.step("test", "Exercise SYNTH PCM through the real SDK with controlled time and input").dependOn(&b.addRunArtifact(tests).step);
 }

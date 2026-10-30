@@ -4,13 +4,26 @@
 
 ## Package
 
-- Version: `0.1.9`
+- Version: `0.1.10`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/SYNTH.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+WAV and the PCM selftest use absolute source deadlines from the real write
+attempt, with fractional ticks and a 160-ms source lead. Source/input work,
+synchronous writes and Busy consume that budget. A long pause expires old
+budget; resuming grants no accumulated burst credit. The final host wait covers
+only remaining time. Quit skips that host wait and still invokes the actual
+owned Close. Deadlines do not acknowledge device playback, and unavailable
+ticks/sleep/frequency fail visibly before opening PCM. The SID/MIDI cadence
+and hardware paths retain their existing contracts.
+
+`./Build.sh test` (Windows: `Build.bat test`) runs actual app/SDK integration
+cases for direct/converted exact PCM, fast/slow work, partial writes/Busy,
+Pause/Resume/Quit, short tails, missing time support and real Close failures.
 
 SID Stop preserves the kernel's private-source and shared-output receipts.
 The app retries only Busy for at most three seconds, sleeping one tick between

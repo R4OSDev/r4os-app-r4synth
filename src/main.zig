@@ -35,8 +35,7 @@ const PlaybackPacer = struct {
     sample_rate: u64,
     timer_hz: u64,
     target_frames: u64,
-    buffered_frames: u64 = 0,
-    remainder: u64 = 0,
+    end_scaled: ?u128 = null,
 
     fn init(sample_rate: u32, timer_hz: u64) PlaybackPacer {
         const rate: u64 = sample_rate;
@@ -47,24 +46,28 @@ const PlaybackPacer = struct {
         };
     }
 
-    fn accepted(self: *PlaybackPacer, ctx: *const App, bytes: usize) void {
-        self.buffered_frames += @as(u64, @intCast(bytes / audio_frame_bytes));
-        if (self.buffered_frames <= self.target_frames) return;
-        const paced_frames = self.buffered_frames - self.target_frames;
-        self.buffered_frames = self.target_frames;
-        self.sleepFrames(ctx, paced_frames);
+    fn accepted(self: *PlaybackPacer, ctx: *const App, bytes: usize, write_started: u64) void {
+        // Absolute source schedule in ticks * sample_rate. Preserve fractional
+        // ticks, charge real RPC time, and never bank credit across a long pause.
+        const start = @as(u128, write_started) * self.sample_rate;
+        const end = @max(self.end_scaled orelse start, start) + @as(u128, bytes / audio_frame_bytes) * self.timer_hz;
+        self.end_scaled = end;
+        // The 160-ms source lead is not a backend-start or playback receipt.
+        self.waitUntil(ctx, end -| (@as(u128, self.target_frames) * self.timer_hz));
     }
 
     fn drain(self: *PlaybackPacer, ctx: *const App) void {
-        const frames = self.buffered_frames;
-        self.buffered_frames = 0;
-        self.sleepFrames(ctx, frames);
+        const end = self.end_scaled orelse return;
+        self.waitUntil(ctx, end);
+        self.end_scaled = null;
     }
 
-    fn sleepFrames(self: *PlaybackPacer, ctx: *const App, frames: u64) void {
-        if (frames == 0) return;
-        const wait_ticks = ticksForFrames(frames, self.sample_rate, self.timer_hz, &self.remainder);
-        if (wait_ticks != 0) ctx.sleepTicks(wait_ticks);
+    fn waitUntil(self: *const PlaybackPacer, ctx: *const App, deadline: u128) void {
+        while (true) {
+            const now = @as(u128, ctx.sys.ticks()) * self.sample_rate;
+            if (now >= deadline) return;
+            ctx.sleepTicks(@intCast((deadline - now + self.sample_rate - 1) / self.sample_rate));
+        }
     }
 };
 
@@ -110,6 +113,12 @@ const App = struct {
     fn timerHz(self: *const App) u64 {
         const hz = self.sys.monotonicHz();
         return if (hz == 0) 100 else hz;
+    }
+
+    fn pcmTimerHz(self: *const App) ?u64 {
+        if (!self.sys.hasFn("ticks") or !self.sys.hasFn("sleep_ticks")) return null;
+        const hz = self.sys.monotonicHz();
+        return if (hz == 0) null else hz;
     }
 
     fn readKey(self: *const App) u8 {
@@ -239,8 +248,9 @@ fn runSelfTest(ctx: *const App) i32 {
 
     var pcm: [512]u8 = undefined;
     fillSelfTestPcm(pcm[0..]);
+    const timer_hz = ctx.pcmTimerHz() orelse return synthFail(ctx, "audio-clock");
     var stream = ctx.audioOpenStream(48_000, 2, .s16le) orelse return synthFail(ctx, "stream-open");
-    var pacer = PlaybackPacer.init(48_000, ctx.timerHz());
+    var pacer = PlaybackPacer.init(48_000, timer_hz);
     const written = writeAudioBlock(ctx, &stream, pcm[0..], &pacer);
     if (written) pacer.drain(ctx);
     const closed = ctx.audioClose(&stream);
@@ -256,6 +266,10 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         return 3;
     };
 
+    const timer_hz = ctx.pcmTimerHz() orelse {
+        ctx.println("Audio clock unavailable.");
+        return 4;
+    };
     var stream = ctx.audioOpenStream(info.sample_rate, 2, .s16le) orelse {
         ctx.println("Audio stream failed.");
         return 4;
@@ -266,7 +280,7 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
     var quit = false;
     var offset = info.data_offset;
     const end = minUsize(data.len, info.data_offset + info.data_len);
-    var pacer = PlaybackPacer.init(info.sample_rate, ctx.timerHz());
+    var pacer = PlaybackPacer.init(info.sample_rate, timer_hz);
 
     while (offset < end) {
         const key = ctx.readKey();
@@ -305,14 +319,15 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
 fn writeAudioBlock(ctx: *const App, stream: *r4os.AudioStream, data: []const u8, pacer: *PlaybackPacer) bool {
     var cursor = r4os.app_audio.WriteCursor.init(data.len, audio_frame_bytes) orelse return false;
     while (!cursor.done()) {
+        const write_started = ctx.sys.ticks();
         const advance = cursor.apply(ctx.audioWrite(stream, data[cursor.accepted..]));
         switch (advance.outcome) {
             .complete => {
-                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted);
+                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted, write_started);
                 return cursor.done();
             },
             .retry => {
-                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted) else ctx.sleepTicks(1);
+                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted, write_started) else ctx.sleepTicks(1);
             },
             .timed_out, .failure, .invalid => return false,
         }
