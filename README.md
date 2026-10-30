@@ -4,13 +4,19 @@
 
 ## Package
 
-- Version: `0.1.6`
+- Version: `0.1.8`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/SYNTH.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+SID Stop preserves the kernel's private-source and shared-output receipts.
+The app retries only Busy for at most three seconds, sleeping one tick between
+attempts, and retains the real error/timeout result. It does not stop hardware
+itself. Stop success with another producer active acknowledges this SID source;
+last-source success also requires the output owner's actual Idle completion.
 
 ## Build
 

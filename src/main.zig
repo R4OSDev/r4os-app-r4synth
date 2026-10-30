@@ -151,7 +151,13 @@ const App = struct {
     }
 
     fn sidStop(self: *const App, handle: u32) i32 {
-        return self.advanced.sidStop(handle);
+        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var result = self.advanced.sidStop(handle);
+        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
+            self.sys.sleepTicks(1);
+            result = self.advanced.sidStop(handle);
+        }
+        return result;
     }
 
     fn sidRelease(self: *const App, handle: u32) i32 {
