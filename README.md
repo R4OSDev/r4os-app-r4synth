@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.8`
+- Version: `0.1.9`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/SYNTH.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -17,6 +17,10 @@ The app retries only Busy for at most three seconds, sleeping one tick between
 attempts, and retains the real error/timeout result. It does not stop hardware
 itself. Stop success with another producer active acknowledges this SID source;
 last-source success also requires the output owner's actual Idle completion.
+The same bounded Busy retry applies to SID Release and MIDI Close. Kernel428
+binds exclusive sessions to the full calling process generation; program threads
+share that process session, and the reaper retains actual teardown obligations
+when application cleanup is skipped.
 
 ## Build
 

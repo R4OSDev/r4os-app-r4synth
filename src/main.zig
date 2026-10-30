@@ -161,7 +161,13 @@ const App = struct {
     }
 
     fn sidRelease(self: *const App, handle: u32) i32 {
-        return self.advanced.sidRelease(handle);
+        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var result = self.advanced.sidRelease(handle);
+        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
+            self.sys.sleepTicks(1);
+            result = self.advanced.sidRelease(handle);
+        }
+        return result;
     }
 
     fn sidModelName(self: *const App) [*:0]const u8 {
@@ -181,7 +187,13 @@ const App = struct {
     }
 
     fn midiClose(self: *const App, handle: u32) i32 {
-        return self.advanced.midiClose(handle);
+        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var result = self.advanced.midiClose(handle);
+        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
+            self.sys.sleepTicks(1);
+            result = self.advanced.midiClose(handle);
+        }
+        return result;
     }
 };
 
