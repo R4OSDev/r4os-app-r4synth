@@ -347,7 +347,12 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         const chunk = prepareWavChunk(info, data[offset..end], pcm_buffer[0..]);
         if (chunk.bytes_read == 0 or chunk.pcm.len == 0) break;
         if (!writeAudioBlock(ctx, &stream, chunk.pcm, &pacer)) {
-            _ = ctx.audioClose(&stream);
+            const stopped = ctx.sys.programShouldClose();
+            const closed = ctx.audioClose(&stream);
+            if (stopped and closed) {
+                ctx.println("Stopped.");
+                return 0;
+            }
             ctx.println("Audio write failed.");
             return 5;
         }
@@ -355,12 +360,13 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
     }
 
     const source_finished = quit or pacer.waitSource(ctx, true);
+    const stopped = quit or ctx.sys.programShouldClose();
     if (!ctx.audioClose(&stream)) {
         ctx.println("Audio close failed.");
         return 5;
     }
-    if (!source_finished) return synthFail(ctx, "source-clock");
-    ctx.println("Done.");
+    if (!source_finished and !stopped) return synthFail(ctx, "source-clock");
+    ctx.println(if (stopped) "Stopped." else "Done.");
     return 0;
 }
 
@@ -657,7 +663,7 @@ fn playMidi(ctx: *const App, data: []const u8) i32 {
         ctx.println("MIDI playback failed.");
         return 6;
     }
-    ctx.println("Done.");
+    ctx.println(if (outcome == .quit) "Stopped." else "Done.");
     return 0;
 }
 
@@ -666,7 +672,7 @@ fn playMidiTrack(ctx: *const App, track: []const u8, synth: u32, midi: *Midi) Mi
     var sent: u32 = 0;
     while (pos < track.len and sent < 16_384) {
         const delta = readVlq(track, &pos) orelse break;
-        if (waitMidi(ctx, midi, synth, delta) < 0) return .failed;
+        if (waitMidi(ctx, midi, synth, delta) < 0) return if (ctx.sys.programShouldClose()) .quit else .failed;
         if (checkPlaybackKey(ctx, &midi.paused)) return .quit;
         while (midi.paused) {
             if (checkPlaybackKey(ctx, &midi.paused)) return .quit;

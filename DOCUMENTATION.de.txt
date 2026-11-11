@@ -42,8 +42,9 @@ Aktueller Stand:
   gepruefte monotone Nanosekunden und die angeforderte logische Tickrate.
   Pause verwirft die Schedule, Resume beginnt ohne angesammeltes Guthaben.
   Sourceende und die wirkliche Streamcloseantwort werden getrennt behandelt.
-  Ein unterbrochener Write meldet weiterhin Fehler, ein Q verlangt echtes
-  Close. Eine fehlende Clock verhindert PCMopen.
+  Ein Closewunsch oder Q verlangt echtes Close und meldet danach Stopped.
+  mit Exit0. Schreib- und Closefehler bleiben sichtbar. Eine fehlende Clock
+  verhindert PCMopen.
 - PSID/RSID-Erkennung mit Header-Ausgabe und SID-Runtime ueber SID.R4D.
 - MIDI-Wiedergabe ueber das MIDI-Backend mit Note/Program/Controller-Events.
 - SID- und MIDI-Wartezeit werden aus der geprueften angeforderten

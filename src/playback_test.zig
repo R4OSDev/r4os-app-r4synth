@@ -368,7 +368,7 @@ test "WAV total deadline uncertainty close and clock replacement keep exact sour
     Host.reset();
     Host.wav(48_000, 2, 16, 9600);
     Host.close_after_calls = 1;
-    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(i32, 0), Host.run("TEST.WAV", true));
     try t.expectEqual(@as(usize, 1), Host.calls);
     try t.expectEqual(@as(usize, 1), Host.closes);
     try t.expectEqual(@as(usize, 1), Host.connections_closed);
@@ -386,4 +386,11 @@ test "WAV total deadline uncertainty close and clock replacement keep exact sour
     try t.expectEqual(@as(i32, 3), Host.run("TEST.WAV", true));
     try t.expectEqual(@as(usize, 0), Host.opens);
     try t.expectEqual(@as(usize, 0), Host.accepted);
+    Host.reset();
+    Host.wav(48_000, 2, 16, 9600);
+    Host.close_after_calls = 1;
+    Host.close_result = a.service_api_result_busy;
+    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(usize, 1), Host.closes);
+    try t.expectEqual(@as(usize, 0), Host.connections_closed);
 }
