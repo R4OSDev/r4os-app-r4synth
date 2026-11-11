@@ -360,7 +360,7 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
     }
 
     const source_finished = quit or pacer.waitSource(ctx, true);
-    const stopped = quit or ctx.sys.programShouldClose();
+    const stopped = ctx.sys.programShouldClose();
     if (!ctx.audioClose(&stream)) {
         ctx.println("Audio close failed.");
         return 5;
@@ -663,7 +663,7 @@ fn playMidi(ctx: *const App, data: []const u8) i32 {
         ctx.println("MIDI playback failed.");
         return 6;
     }
-    ctx.println(if (outcome == .quit) "Stopped." else "Done.");
+    ctx.println(if (ctx.sys.programShouldClose()) "Stopped." else "Done.");
     return 0;
 }
 
