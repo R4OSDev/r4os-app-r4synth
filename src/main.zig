@@ -1,4 +1,6 @@
 const r4os = @import("r4os");
+const std = @import("std");
+const time = r4os.time_contract.checked;
 
 const max_file = 262_144;
 const audio_frame_bytes: usize = 2 * @sizeOf(i16);
@@ -7,6 +9,41 @@ const wav_chunk_bytes = r4os.app_audio.max_write_payload - r4os.app_audio.max_wr
 const synth_sample_rate: u32 = 48_000;
 const synth_render_max_frames: u16 = 1024;
 const selftest_arg = "/SELFTEST";
+
+test "SYNTH close owner still requests Stop Release and Close without a clock" {
+    const a2 = r4os.platform2.abi;
+    const Peer = struct {
+        var calls: usize = 0;
+        var result: i32 = 0;
+        fn close(_: u32) callconv(.c) i32 {
+            calls += 1;
+            return result;
+        }
+    };
+    Peer.calls = 0;
+    Peer.result = 0;
+    const system: a2.R4XStartR4Sys2 = .{};
+    const audio: a2.R4XStartR4Audio2 = .{
+        .sid_stop = @intFromPtr(&Peer.close),
+        .sid_release = @intFromPtr(&Peer.close),
+        .midi_close = @intFromPtr(&Peer.close),
+    };
+    const imports = [_]r4os.abi.R4XStartImport{
+        .{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&system) },
+        .{ .group_id = 5, .resolved_version = 2, .table = @intFromPtr(&audio) },
+    };
+    const start: a2.R4XStartContext2 = .{ .imports = @intFromPtr(&imports), .import_count = imports.len };
+    const context = try r4os.platform2.Context.init(&start);
+    const base: r4os.program.Context = .{ .generation2 = &context };
+    const app = App{ .sys = r4os.r4sys.Context.fromProgram(base), .desk = undefined, .audio = undefined, .advanced = .{ .raw = r4os.r4audio.Context.fromProgram(base) } };
+    try std.testing.expectEqual(@as(i32, 0), app.sidStop(7));
+    try std.testing.expectEqual(@as(i32, 0), app.sidRelease(7));
+    try std.testing.expectEqual(@as(i32, 0), app.midiClose(7));
+    try std.testing.expectEqual(@as(usize, 3), Peer.calls);
+    Peer.result = r4os.abi.service_api_result_busy;
+    try std.testing.expectEqual(r4os.abi.service_api_result_busy, app.sidStop(7));
+    try std.testing.expectEqual(@as(usize, 4), Peer.calls);
+}
 
 const WavInfo = struct {
     sample_rate: u32,
@@ -32,42 +69,34 @@ const MidiTrackResult = enum {
 };
 
 const PlaybackPacer = struct {
-    sample_rate: u64,
-    timer_hz: u64,
-    target_frames: u64,
-    end_scaled: ?u128 = null,
+    source: r4os.pcm_source.Pacer,
 
-    fn init(sample_rate: u32, timer_hz: u64) PlaybackPacer {
-        const rate: u64 = sample_rate;
-        return .{
-            .sample_rate = rate,
-            .timer_hz = timer_hz,
-            .target_frames = (rate * audio_prefill_milliseconds + 999) / 1000,
-        };
+    fn init(ctx: *const App, rate: u32) ?PlaybackPacer {
+        const sample = ctx.pcmClock() orelse return null;
+        const lead = (@as(u64, rate) * audio_prefill_milliseconds + 999) / 1000;
+        return .{ .source = r4os.pcm_source.Pacer.init(rate, audio_frame_bytes, lead, sample) catch return null };
     }
 
-    fn accepted(self: *PlaybackPacer, ctx: *const App, bytes: usize, write_started: u64) void {
-        // Absolute source schedule in ticks * sample_rate. Preserve fractional
-        // ticks, charge real RPC time, and never bank credit across a long pause.
-        const start = @as(u128, write_started) * self.sample_rate;
-        const end = @max(self.end_scaled orelse start, start) + @as(u128, bytes / audio_frame_bytes) * self.timer_hz;
-        self.end_scaled = end;
-        // The 160-ms source lead is not a backend-start or playback receipt.
-        self.waitUntil(ctx, end -| (@as(u128, self.target_frames) * self.timer_hz));
+    fn accepted(self: *PlaybackPacer, ctx: *const App, bytes: u32, began: time.ClockSample) bool {
+        _ = self.source.accepted(bytes, began) catch return false;
+        return self.waitSource(ctx, false);
     }
 
-    fn drain(self: *PlaybackPacer, ctx: *const App) void {
-        const end = self.end_scaled orelse return;
-        self.waitUntil(ctx, end);
-        self.end_scaled = null;
-    }
-
-    fn waitUntil(self: *const PlaybackPacer, ctx: *const App, deadline: u128) void {
-        while (true) {
-            const now = @as(u128, ctx.sys.ticks()) * self.sample_rate;
-            if (now >= deadline) return;
-            ctx.sleepTicks(@intCast((deadline - now + self.sample_rate - 1) / self.sample_rate));
+    fn waitSource(self: *PlaybackPacer, ctx: *const App, finish: bool) bool {
+        while (!ctx.sys.programShouldClose()) {
+            const now = ctx.pcmClock() orelse return false;
+            const deadline = self.source.deadline(now, finish) catch return false;
+            if (deadline.wait_ns == 0) return true;
+            const ticks = time.scaleCeil(deadline.wait_ns, now.identity.tick_hz, 1_000_000_000) catch return false;
+            ctx.sleepTicks(ticks);
         }
+        return false;
+    }
+
+    fn setPaused(self: *PlaybackPacer, ctx: *const App, paused: bool) bool {
+        const now = ctx.pcmClock() orelse return false;
+        if (paused) self.source.pause(now) catch return false else self.source.resumeSource(now) catch return false;
+        return true;
     }
 };
 
@@ -77,7 +106,7 @@ const App = struct {
     audio: r4os.Audio,
     advanced: r4os.AdvancedAudio,
 
-    fn init(app: *r4os.App) ?App {
+    fn init(app: *r4os.App2) ?App {
         const audio = app.audio() orelse return null;
         return .{ .sys = app.system(), .desk = app.desktop() orelse return null, .audio = audio, .advanced = audio.advanced() };
     }
@@ -103,7 +132,12 @@ const App = struct {
     }
 
     fn fileRead(self: *const App, path: [*:0]const u8, out: []u8) i32 {
-        return self.sys.fileRead(path, out);
+        const files = r4os.app_storage.Files{ .sys = self.sys };
+        const parsed = r4os.app_storage.FilePath.parse(std.mem.span(path)) catch return -1;
+        return switch (files.readDocumentPrefix(parsed.asZ(), out, operationTimeout())) {
+            .value => |value| if (value.truncated or value.bytes > max_file) -1 else @intCast(value.bytes),
+            .failure => |rc| rc,
+        };
     }
 
     fn sleepTicks(self: *const App, duration: u64) void {
@@ -111,14 +145,16 @@ const App = struct {
     }
 
     fn timerHz(self: *const App) u64 {
-        const hz = self.sys.monotonicHz();
-        return if (hz == 0) 100 else hz;
+        const sample = self.pcmClock() orelse return 0;
+        return sample.identity.tick_hz;
     }
 
-    fn pcmTimerHz(self: *const App) ?u64 {
-        if (!self.sys.hasFn("ticks") or !self.sys.hasFn("sleep_ticks")) return null;
-        const hz = self.sys.monotonicHz();
-        return if (hz == 0) null else hz;
+    fn pcmClock(self: *const App) ?time.ClockSample {
+        if (!self.sys.hasFn("sleep_ticks")) return null;
+        var info: r4os.abi.MonotonicClockInfo = .{};
+        if (self.sys.monotonicClock(&info) <= 0) return null;
+        const sample = time.ClockSample.fromInfo(info) catch return null;
+        return if (sample.identity.tick_hz == 0) null else sample;
     }
 
     fn readKey(self: *const App) u8 {
@@ -126,18 +162,14 @@ const App = struct {
     }
 
     fn audioOpenStream(self: *const App, rate: u32, channels: u16, format: r4os.PcmFormat) ?r4os.AudioStream {
-        return switch (self.audio.openStream(rate, channels, format, r4os.app_audio.default_volume, r4os.time_contract.timeoutForever())) {
+        return switch (self.audio.openStream(rate, channels, format, r4os.app_audio.default_volume, operationTimeout())) {
             .stream => |stream| stream,
             else => null,
         };
     }
 
-    fn audioWrite(_: *const App, stream: *r4os.AudioStream, data: []const u8) r4os.app_audio.WriteResult {
-        return stream.write(data, r4os.time_contract.timeoutForever());
-    }
-
     fn audioClose(_: *const App, stream: *r4os.AudioStream) bool {
-        return switch (stream.close(r4os.time_contract.timeoutForever())) {
+        return switch (stream.close(operationTimeout())) {
             .ok => true,
             else => false,
         };
@@ -160,20 +192,18 @@ const App = struct {
     }
 
     fn sidStop(self: *const App, handle: u32) i32 {
-        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var deadline = self.synthDeadline();
         var result = self.advanced.sidStop(handle);
-        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
-            self.sys.sleepTicks(1);
+        while (result == r4os.abi.service_api_result_busy and deadline != null and self.retrySynth(&deadline.?, true)) {
             result = self.advanced.sidStop(handle);
         }
         return result;
     }
 
     fn sidRelease(self: *const App, handle: u32) i32 {
-        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var deadline = self.synthDeadline();
         var result = self.advanced.sidRelease(handle);
-        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
-            self.sys.sleepTicks(1);
+        while (result == r4os.abi.service_api_result_busy and deadline != null and self.retrySynth(&deadline.?, true)) {
             result = self.advanced.sidRelease(handle);
         }
         return result;
@@ -196,19 +226,30 @@ const App = struct {
     }
 
     fn midiClose(self: *const App, handle: u32) i32 {
-        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var deadline = self.synthDeadline();
         var result = self.advanced.midiClose(handle);
-        while (result == r4os.abi.service_api_result_busy and self.sys.ticks() < deadline) {
-            self.sys.sleepTicks(1);
+        while (result == r4os.abi.service_api_result_busy and deadline != null and self.retrySynth(&deadline.?, true)) {
             result = self.advanced.midiClose(handle);
         }
         return result;
     }
+
+    fn synthDeadline(self: *const App) ?time.DeadlineBudget {
+        return time.DeadlineBudget.init(self.pcmClock() orelse return null, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 3_000_000_000 })) catch null;
+    }
+
+    fn retrySynth(self: *const App, deadline: *time.DeadlineBudget, closing: bool) bool {
+        if (!closing and self.sys.programShouldClose()) return false;
+        const remaining = deadline.remaining(self.pcmClock() orelse return false) catch return false;
+        if (remaining.kind == 0) return false;
+        self.sleepTicks(1);
+        return true;
+    }
 };
 
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const ctx = App.init(app) orelse return r4os.abi.err_no_group;
-    var filebuf: [max_file]u8 = undefined;
+    var filebuf: [max_file + 1]u8 = undefined;
     var pcm_buffer: [wav_chunk_bytes]u8 = undefined;
 
     ctx.println("R4Synth 0.1");
@@ -241,18 +282,17 @@ pub fn r4_app_main(app: *r4os.App) i32 {
 fn runSelfTest(ctx: *const App) i32 {
     ctx.println("SYNTH selftest");
     var status: r4os.abi.AudioServiceStatus = .{};
-    if (switch (ctx.audio.status(r4os.time_contract.timeoutForever(), &status)) {
+    if (switch (ctx.audio.status(operationTimeout(), &status)) {
         .ok => false,
         else => true,
     }) return synthFail(ctx, "audsvc-status");
 
     var pcm: [512]u8 = undefined;
     fillSelfTestPcm(pcm[0..]);
-    const timer_hz = ctx.pcmTimerHz() orelse return synthFail(ctx, "audio-clock");
+    var pacer = PlaybackPacer.init(ctx, 48_000) orelse return synthFail(ctx, "audio-clock");
     var stream = ctx.audioOpenStream(48_000, 2, .s16le) orelse return synthFail(ctx, "stream-open");
-    var pacer = PlaybackPacer.init(48_000, timer_hz);
-    const written = writeAudioBlock(ctx, &stream, pcm[0..], &pacer);
-    if (written) pacer.drain(ctx);
+    var written = writeAudioBlock(ctx, &stream, pcm[0..], &pacer);
+    if (written) written = pacer.waitSource(ctx, true);
     const closed = ctx.audioClose(&stream);
     if (!written or !closed) return synthFail(ctx, "stream-cycle");
 
@@ -266,7 +306,7 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         return 3;
     };
 
-    const timer_hz = ctx.pcmTimerHz() orelse {
+    var pacer = PlaybackPacer.init(ctx, info.sample_rate) orelse {
         ctx.println("Audio clock unavailable.");
         return 4;
     };
@@ -280,9 +320,12 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
     var quit = false;
     var offset = info.data_offset;
     const end = minUsize(data.len, info.data_offset + info.data_len);
-    var pacer = PlaybackPacer.init(info.sample_rate, timer_hz);
 
     while (offset < end) {
+        if (ctx.sys.programShouldClose()) {
+            quit = true;
+            break;
+        }
         const key = ctx.readKey();
         if (key == 'q' or key == 'Q') {
             quit = true;
@@ -290,6 +333,10 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         }
         if (key == 'p' or key == 'P') {
             paused = !paused;
+            if (!pacer.setPaused(ctx, paused)) {
+                _ = ctx.audioClose(&stream);
+                return synthFail(ctx, "pause-clock");
+            }
             ctx.println(if (paused) "Paused" else "Playing");
         }
         if (paused) {
@@ -307,32 +354,39 @@ fn playWav(ctx: *const App, data: []const u8, pcm_buffer: []u8) i32 {
         offset += chunk.bytes_read;
     }
 
-    if (!quit) pacer.drain(ctx);
+    const source_finished = quit or pacer.waitSource(ctx, true);
     if (!ctx.audioClose(&stream)) {
         ctx.println("Audio close failed.");
         return 5;
     }
+    if (!source_finished) return synthFail(ctx, "source-clock");
     ctx.println("Done.");
     return 0;
 }
 
 fn writeAudioBlock(ctx: *const App, stream: *r4os.AudioStream, data: []const u8, pacer: *PlaybackPacer) bool {
-    var cursor = r4os.app_audio.WriteCursor.init(data.len, audio_frame_bytes) orelse return false;
-    while (!cursor.done()) {
-        const write_started = ctx.sys.ticks();
-        const advance = cursor.apply(ctx.audioWrite(stream, data[cursor.accepted..]));
-        switch (advance.outcome) {
-            .complete => {
-                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted, write_started);
-                return cursor.done();
-            },
-            .retry => {
-                if (advance.accepted != 0) pacer.accepted(ctx, advance.accepted, write_started) else ctx.sleepTicks(1);
-            },
-            .timed_out, .failure, .invalid => return false,
+    var writer: r4os.audio_write.Writer = undefined;
+    if (r4os.audio_write.Writer.init(.{ .address = @intFromPtr(data.ptr), .length = data.len }, .fromStream(stream), operationTimeout(), &writer) != 0) return false;
+    var accepted: u64 = 0;
+    while (true) {
+        const began = ctx.pcmClock() orelse return false;
+        var progress: r4os.audio_write.Progress = undefined;
+        if (writer.writeBounded(64, ctx.sys.programShouldClose(), &progress) != 0) return false;
+        const prefix: u32 = @intCast(progress.io.bytes - accepted);
+        accepted = progress.io.bytes;
+        if (prefix != 0 and !pacer.accepted(ctx, prefix, began)) return false;
+        const outcome: r4os.stream_transfer.Outcome = @enumFromInt(progress.io.outcome);
+        switch (outcome) {
+            .complete => return true,
+            .pending => {},
+            .would_block => if (prefix == 0) ctx.sleepTicks(1),
+            else => return false,
         }
     }
-    return true;
+}
+
+fn operationTimeout() r4os.abi.R4Timeout {
+    return r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 });
 }
 
 const WavChunk = struct {
@@ -418,6 +472,8 @@ fn parseWav(data: []const u8) ?WavInfo {
             data_found = true;
         }
         if (fmt_found and data_found) {
+            const frame_bytes = @as(usize, channels) * (bits / 8);
+            if (sample_rate == 0 or frame_bytes == 0 or data_len % frame_bytes != 0) return null;
             return .{
                 .sample_rate = sample_rate,
                 .channels = channels,
@@ -493,6 +549,7 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
     if (init_addr == 0) init_addr = load_addr;
     ctx.println(if (frame_hz == 60) "Playback rate: 60 Hz" else "Playback rate: 50 Hz");
     ctx.println("Starting SID runtime...");
+    if (ctx.pcmClock() == null) return synthFail(ctx, "sid-clock");
     const handle = ctx.sidAcquire();
     if (handle < 0) {
         ctx.println("SID runtime failed. Run AUDIO.");
@@ -508,6 +565,7 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
         var pacing_remainder: u64 = 0;
         const timer_hz = ctx.timerHz();
         while (true) {
+            if (ctx.sys.programShouldClose()) break;
             const key = ctx.readKey();
             if (key == 'q' or key == 'Q') break;
             if (key == 'p' or key == 'P') {
@@ -515,10 +573,11 @@ fn playSid(ctx: *const App, data: []const u8, psid: bool) i32 {
                 ctx.println(if (paused) "Paused" else "Playing");
             }
             if (!paused) {
+                var deadline = ctx.synthDeadline() orelse return sidFailRelease(ctx, sid_handle);
                 while (true) {
                     const result = ctx.sidPlayFrame(sid_handle, play_addr, frame_hz);
                     if (result == r4os.abi.service_api_result_busy) {
-                        ctx.sleepTicks(1);
+                        if (!ctx.retrySynth(&deadline, false)) return sidFailRelease(ctx, sid_handle);
                         continue;
                     }
                     if (result < 0) return sidFailRelease(ctx, sid_handle);
@@ -672,12 +731,15 @@ fn shouldSendMidi(event_type: u8, data1: u8) bool {
 fn waitMidi(ctx: *const App, midi: *Midi, synth: u32, delta: u32) i32 {
     var remaining_frames = midiFramesForDelta(midi, delta);
     const timer_hz = ctx.timerHz();
+    if (timer_hz == 0) return r4os.abi.err_no_fn;
     while (remaining_frames > 0) {
+        if (ctx.sys.programShouldClose()) return r4os.abi.err_closed;
         const frames: u16 = @intCast(@min(remaining_frames, @as(u64, synth_render_max_frames)));
+        var deadline = ctx.synthDeadline() orelse return r4os.abi.err_no_fn;
         while (true) {
             const result = ctx.midiRender(synth, frames);
             if (result == r4os.abi.service_api_result_busy) {
-                ctx.sleepTicks(1);
+                if (!ctx.retrySynth(&deadline, false)) return r4os.abi.service_api_result_busy;
                 continue;
             }
             if (result < 0) return result;
@@ -700,6 +762,7 @@ fn midiFramesForDelta(midi: *Midi, delta: u32) u64 {
 }
 
 fn checkPlaybackKey(ctx: *const App, paused: *bool) bool {
+    if (ctx.sys.programShouldClose()) return true;
     const key = ctx.readKey();
     if (key == 'q' or key == 'Q') return true;
     if (key == 'p' or key == 'P') {

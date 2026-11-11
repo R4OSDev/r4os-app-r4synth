@@ -2,9 +2,10 @@ const std = @import("std");
 const r4os = @import("r4os");
 const app = @import("main.zig");
 const a = r4os.abi;
+const a2 = r4os.platform2.abi;
 const t = std.testing;
 
-// Exercise the real application, WAV conversion, WriteCursor and owned SDK
+// Exercise the real application, WAV conversion, total Writer/PcmSourcePacer and owned SDK
 // transport. Only external time, input/file and service callbacks are modeled.
 const Host = struct {
     var now: u64 = 0;
@@ -25,6 +26,9 @@ const Host = struct {
     var closes: usize = 0;
     var connections_closed: usize = 0;
     var close_result: i32 = 0;
+    var timeout_at: usize = 0;
+    var close_after_calls: usize = 0;
+    var clock_after_calls: usize = 0;
     var source_rate: u32 = 48_000;
     var first_write: ?u64 = null;
     var largest_source_lead: u64 = 0;
@@ -56,6 +60,9 @@ const Host = struct {
         closes = 0;
         connections_closed = 0;
         close_result = 0;
+        timeout_at = 0;
+        close_after_calls = 0;
+        clock_after_calls = 0;
         source_rate = 48_000;
         first_write = null;
         largest_source_lead = 0;
@@ -104,17 +111,22 @@ const Host = struct {
         now += count;
     }
     fn clock(out: *a.MonotonicClockInfo) callconv(.c) i32 {
-        out.* = .{ .event_effective_hz = hz };
+        out.* = .{ .flags = a.monotonic_clock_flag_valid, .source = 1, .generation = if (clock_after_calls != 0 and calls >= clock_after_calls) 2 else 1, .resolution_ns = 1, .instant_ns = now * 1_000_000, .event_requested_hz = hz, .event_effective_hz = hz };
         return 1;
     }
     fn output(_: [*]const u8, len: u32) callconv(.c) i32 {
         return @intCast(len);
     }
-    fn read(_: [*:0]const u8, out: [*]u8, capacity: u32) callconv(.c) i32 {
-        if (file_len > capacity) return -1;
-        now += file_cost;
-        @memcpy(out[0..file_len], file[0..file_len]);
-        return @intCast(file_len);
+    fn metadata(_: [*:0]const u8, out: *a.FileMetadata2) callconv(.c) i32 {
+        out.* = .{ .flags = a.file_metadata2_flag_byte_size_valid, .byte_size = file_len };
+        return 1;
+    }
+    fn readAt(_: [*:0]const u8, offset: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
+        if (offset > file_len) return -1;
+        if (offset == 0) now += file_cost;
+        const count = @min(capacity, file_len - offset);
+        @memcpy(out[0..count], file[offset..][0..count]);
+        return @intCast(count);
     }
     fn key() callconv(.c) u8 {
         key_calls += 1;
@@ -156,6 +168,7 @@ const Host = struct {
             },
             a.audio_service_op_write_stream => {
                 calls += 1;
+                if (timeout_at != 0 and calls == timeout_at) return a.service_api_result_timeout;
                 const began = now;
                 now += write_cost;
                 const n = @sizeOf(a.AudioServiceStreamWriteRequest);
@@ -186,21 +199,35 @@ const Host = struct {
         header.* = .{ .op = op, .status = 0, .payload_len = @sizeOf(@TypeOf(reply)) };
         return @sizeOf(@TypeOf(reply));
     }
+    fn shouldClose(_: *const a2.R4XStartContext2) callconv(.c) u32 {
+        return @intFromBool(close_after_calls != 0 and calls >= close_after_calls);
+    }
     fn run(args: [:0]const u8, ticks_available: bool) i32 {
-        const raw = a.R4XStartContext{ .args = @intFromPtr(args.ptr), .args_len = @intCast(args.len) };
-        var sys: a.R4XStartR4Sys = .{};
+        var raw: a2.R4XStartContext2 = .{ .args = @intFromPtr(args.ptr), .args_len = @intCast(args.len), .app_class = 1, .flags = a.r4xstart_flag_imports_valid | a.r4xstart_flag_close_supported, .should_close = @intFromPtr(@as(a2.R4XStartShouldCloseFn2, &shouldClose)) };
+        var sys: a2.R4XStartR4Sys2 = .{};
         sys.ticks = if (ticks_available) @intFromPtr(&ticks) else 0;
         sys.sleep_ticks = if (sleep_available) @intFromPtr(&sleep) else 0;
-        sys.monotonic_clock = @intFromPtr(&clock);
+        sys.monotonic_clock = if (ticks_available) @intFromPtr(&clock) else 0;
         sys.write = @intFromPtr(&output);
-        sys.file_read = @intFromPtr(&read);
+        sys.file_read_at = @intFromPtr(&readAt);
+        sys.file_metadata2 = @intFromPtr(&metadata);
         sys.service_open = @intFromPtr(&open);
         sys.service_close = @intFromPtr(&disconnect);
         sys.service_call = @intFromPtr(&call);
-        var desk: a.R4XStartR4Desk = .{};
+        var desk: a2.R4XStartR4Desk2 = .{};
         desk.read_key = @intFromPtr(&key);
-        const audio: a.R4XStartR4Audio = .{};
-        var instance = r4os.App{ .raw = &raw, .bundle = .{ .raw = &raw, .sys = &sys, .audio = &audio, .desk = &desk }, .profile = .console };
+        const audio: a2.R4XStartR4Audio2 = .{};
+        const imports = [_]a.R4XStartImport{
+            .{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&sys) },
+            .{ .group_id = 2, .resolved_version = 2, .table = @intFromPtr(&desk) },
+            .{ .group_id = 5, .resolved_version = 2, .table = @intFromPtr(&audio) },
+        };
+        raw.imports = @intFromPtr(&imports);
+        raw.import_count = imports.len;
+        var instance = switch (r4os.App2.init(&raw, .console)) {
+            .value => |value| value,
+            .failure => return -99,
+        };
         return app.r4_app_main(&instance);
     }
 };
@@ -318,4 +345,45 @@ test "SYNTH PCM rejects absent timing and never fabricates a close receipt" {
     try t.expect(Host.run("TEST.WAV", true) != 0);
     try t.expectEqual(@as(usize, 1), Host.closes);
     try t.expectEqual(@as(usize, 0), Host.connections_closed);
+}
+
+test "WAV total deadline uncertainty close and clock replacement keep exact source ownership" {
+    Host.reset();
+    Host.wav(48_000, 2, 16, 9600);
+    Host.initial_busy = 100_000;
+    Host.write_cost = 1;
+    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(usize, 0), Host.accepted);
+    try t.expectEqual(@as(u64, 5000), Host.now);
+    try t.expectEqual(@as(usize, 1), Host.closes);
+    try t.expectEqual(@as(usize, 1), Host.connections_closed);
+    Host.reset();
+    Host.wav(48_000, 2, 16, 9600);
+    Host.fragmented = true;
+    Host.timeout_at = 2;
+    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(usize, 2), Host.calls);
+    try t.expectEqual(@as(usize, 400), Host.accepted);
+    try t.expectEqual(@as(usize, 1), Host.closes);
+    Host.reset();
+    Host.wav(48_000, 2, 16, 9600);
+    Host.close_after_calls = 1;
+    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(usize, 1), Host.calls);
+    try t.expectEqual(@as(usize, 1), Host.closes);
+    try t.expectEqual(@as(usize, 1), Host.connections_closed);
+    Host.reset();
+    Host.wav(48_000, 2, 16, 9600);
+    Host.clock_after_calls = 1;
+    try t.expect(Host.run("TEST.WAV", true) != 0);
+    try t.expectEqual(@as(usize, 1), Host.calls);
+    try t.expectEqual(@as(usize, 1), Host.closes);
+    Host.reset();
+    Host.wav(48_000, 2, 16, 1);
+    Host.file_len = 47;
+    std.mem.writeInt(u32, Host.file[4..8], 39, .little);
+    std.mem.writeInt(u32, Host.file[40..44], 3, .little);
+    try t.expectEqual(@as(i32, 3), Host.run("TEST.WAV", true));
+    try t.expectEqual(@as(usize, 0), Host.opens);
+    try t.expectEqual(@as(usize, 0), Host.accepted);
 }

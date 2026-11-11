@@ -19,9 +19,9 @@ Projektstruktur seit 0.51.20:
 - Der Workspace-Build uebernimmt das Modul in den ausgewaehlten Imageplan.
 
 Contract:
-- fachlicher Einstieg: `r4_app_main`; das SDK exportiert `R4XStart`
+- fachlicher Einstieg: `r4_app_main`; das SDK exportiert `R4XStart2`
 - App-Klasse: `console`
-- Eingebaute Platform-API-Imports: `R4SYS`, `R4DESK`, `R4AUDIO`
+- Eingebaute Platform-API-Imports ueber Query2: `R4SYS`, `R4DESK`, `R4AUDIO`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\SYNTH.R4X`
 
 Das Image-Build-Script kopiert SYNTH.R4X nach /R4OS/SOFTWARE/TERMINAL/SYNTH.R4X. Testdateien
@@ -35,22 +35,19 @@ Aktueller Stand:
 - WAV-Bloecke passen in genau ein AudioService-Payload. Teilfortschritt wird
   framegenau beibehalten; Busy wiederholt nur den Rest, Timeout oder Fehler
   brechen sichtbar ab und ein fehlgeschlagener Lauf meldet nicht `Done`.
-- WAV und PCM-Selbsttest behalten 160 ms Quellvorlauf. Ab0.88.57/SYNTH0.1.10
-  laufen absolute Hostfristen ab Beginn der jeweiligen Schreibversuche;
-  Quell-/Konvertierungs-, RPC-, Busy- und Bedienzeit verbrauchen das Budget.
-  Eine lange Pause laesst alte Fristen auslaufen; Resume erhaelt kein
-  angesammeltes Zeitguthaben. Ticks*Samplerate erhalten Bruchteile exakt,
-  nur ein positiver Fristrest wird auf einen Tick aufgerundet. Abschliessend
-  wird nur der verbleibende Hostrest gewartet; Q ueberspringt diesen Wait,
-  aber beide Pfade verlangen weiterhin echtes Close. Weder160msVorfuellung
-  noch Hostfristen belegen abgespielte Frames. HDA47 hat eine eigene echte
-  2x480-Frame-Startschwelle sowie seinen Tail-/Drainpfad. Fehlende ticks/
-  sleep_ticks oder unbekannte wirksame Ereignisrate brechen PCM vorOpen
-  sichtbar ab. SID-/MIDI-Hardwarepfade und deren Taktung bleiben eigenstaendig.
+- WAV und PCM-Selbsttest verwenden den gemeinsamen Gesamtwriter mit5s
+  je PCMblock und pcm_source.Pacer mit160msQuellvorlauf. Bestaetigte ganze
+  Framepraefixe bleiben genau erhalten. Busy verbraucht die bestehende Frist,
+  ungewisse Antworten beenden den Writer. Die rationale Quellzeit verwendet
+  gepruefte monotone Nanosekunden und die angeforderte logische Tickrate.
+  Pause verwirft die Schedule, Resume beginnt ohne angesammeltes Guthaben.
+  Sourceende und die wirkliche Streamcloseantwort werden getrennt behandelt.
+  Ein unterbrochener Write meldet weiterhin Fehler, ein Q verlangt echtes
+  Close. Eine fehlende Clock verhindert PCMopen.
 - PSID/RSID-Erkennung mit Header-Ausgabe und SID-Runtime ueber SID.R4D.
 - MIDI-Wiedergabe ueber das MIDI-Backend mit Note/Program/Controller-Events.
-- WAV-, SID- und MIDI-Zeit werden aus der wirksamen R4SYS-Ereignisrate
-  abgeleitet. MIDI-Tempo bleibt in Mikrosekunden pro Viertelnote erhalten und
+- SID- und MIDI-Wartezeit werden aus der geprueften angeforderten
+  R4SYS-Ereignisrate abgeleitet. MIDI-Tempo bleibt in Mikrosekunden pro Viertelnote erhalten und
   wird mit Restakkumulator in 48-kHz-Frames umgerechnet; eine Viertelnote bei
   120 BPM umfasst dadurch 24.000 Frames beziehungsweise 500 ms.
 - MIDI rendert produktiv in Bloecken von 1 bis 1024 Frames. `Busy` wiederholt
@@ -92,3 +89,15 @@ unterstuetzt gemeldet. Vollstaendige ROM-/IRQ-Ausfuehrung, dynamische
 CIA-Timer und echte NTSC-Oszillator-/VIC-Takte sind weiterhin nicht enthalten.
 
 Referenz: https://hvsc.c64.org/download/C64Music/DOCUMENTS/SID_file_format.txt
+
+Datei- und Abbaugrenzen ab SYNTH0.1.12
+-------------------------------------
+Der normale Einstieg verwendet App2. WAV, MIDI und SID werden ueber einen
+privaten begrenzten Dateistand mit Metadatenpruefung gelesen. Mehr als256KB
+oder ein unvollstaendiger PCMframe werden sichtbar abgewiesen. Unterstuetzte
+Formate und die bisherigen unabhaengigen Synthinterfaces bleiben erhalten.
+SID/MIDI-Busy-Wiederholungen verwenden eine gepruefte3Sekundenfrist und
+beachten Close. Stop/Release/Close werden auch bei verlorener Clock einmal
+wirklich angefordert. Weitere Busyversuche benoetigen eine gueltige Frist.
+Eine erfolgreiche Sourceuebergabe beschreibt angenommene Frames. Ausgabe-
+und Stopantworten werden an den tatsaechlichen Anbietern geprueft.
